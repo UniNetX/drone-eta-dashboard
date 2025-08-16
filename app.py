@@ -7,259 +7,373 @@
 # matplotlib
 # seaborn
 
-import streamlit as st
-import pandas as pd
+import os
+import io
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import pandas as pd
+import streamlit as st
+import plotly.express as px
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
 from sklearn.metrics import r2_score, mean_absolute_percentage_error
+import warnings
+warnings.filterwarnings("ignore")
 
-# Streamlit app title and description
-st.set_page_config(layout="wide", page_title="Drone ETA Dashboard")
-st.title("Drone Estimated Time of Arrival (ETA) Dashboard �")
-st.markdown("""
-This dashboard provides a comprehensive view of the stacked ensemble model's performance for predicting drone flight times.
-Explore the interactive prediction tool and review key performance metrics and visualizations below.
-""")
+st.set_page_config(page_title="Drone ETA Lab", page_icon="🛩️", layout="wide")
 
-# IMPORTANT: This path is for a local file.
-# Replace with the path to your 'CarnegieMellonDataMain.csv' file.
-FILE_PATH = "CarnegieMellonDataMain.csv"
+# -----------------------------
+# Sidebar / Header
+# -----------------------------
+st.sidebar.title("🛩️ Drone ETA Lab")
+st.sidebar.markdown(
+"""
+**What this does**
+- Trains an ETA model from your dataset  
+- Shows calibration & error by wind  
+- Gives prediction intervals  
+- Lets you test “what-if” inputs  
+- Batch-predict on uploaded CSV  
+"""
+)
 
-# === 1. Data Loading and Feature Engineering (Cached for Performance) ===
-@st.cache_data
-def load_and_preprocess_data():
-    """
-    Loads data and performs all necessary preprocessing and feature engineering.
-    This function is cached to prevent re-running on every app interaction.
-    """
-    with st.spinner('Loading and preprocessing data...'):
+# -----------------------------
+# Data loader with caching
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_data_from_path(path: str) -> pd.DataFrame:
+    df = pd.DataFrame()
+    if path is None:
+        return df
+    try:
+        if isinstance(path, str) and os.path.exists(path):
+            df = pd.read_csv(path)
+        else:
+            # If path is bytes or buffer, let calling code pass it to read_csv
+            df = pd.read_csv(path)
+    except Exception as e:
+        st.warning(f"Could not load data: {e}")
+        return pd.DataFrame()
+    df.columns = df.columns.str.strip()
+    # Coerce numeric cols quietly
+    for col in ["time","altitude","velocity_x","velocity_y","velocity_z",
+                 "speed","payload","wind_speed","position_x","position_y","position_z"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+# -----------------------------
+# Feature engineering (cached)
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"flight","time","speed","payload","altitude","wind_speed",
+                 "velocity_x","velocity_y","velocity_z","position_x","position_y","position_z"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Dataset missing required columns: {sorted(list(missing))}")
+
+    flight_summary = df.groupby('flight').agg(
+        total_time=('time', 'max'),
+        average_speed=('speed', 'mean'),
+        max_payload=('payload', 'max'),
+        max_altitude=('altitude', 'max'),
+        average_wind_speed=('wind_speed', 'mean'),
+        max_velocity_combined=('velocity_x', lambda x: np.sqrt(x**2 + df.loc[x.index, 'velocity_y']**2 + df.loc[x.index, 'velocity_z']**2).max()),
+        start_pos_x=('position_x', 'first'),
+        start_pos_y=('position_y', 'first'),
+        start_pos_z=('position_z', 'first'),
+        end_pos_x=('position_x', 'last'),
+        end_pos_y=('position_y', 'last'),
+        end_pos_z=('position_z', 'last')
+    ).reset_index()
+
+    flight_summary["total_distance"] = np.sqrt(
+        (flight_summary['end_pos_x'] - flight_summary['start_pos_x'])**2 +
+        (flight_summary['end_pos_y'] - flight_summary['start_pos_y'])**2 +
+        (flight_summary['end_pos_z'] - flight_summary['start_pos_z'])**2
+    )
+
+    # Extra features (same as your Colab)
+    flight_summary["altitude_change_rate"] = flight_summary["max_altitude"] / flight_summary["total_time"]
+    flight_summary["efficiency"] = flight_summary["total_distance"] / flight_summary["total_time"]
+
+    flight_summary = flight_summary.replace([np.inf, -np.inf], np.nan).dropna()
+    flight_summary = flight_summary[flight_summary["total_time"] > 0]
+    return flight_summary
+
+# -----------------------------
+# Model training (cached)
+# -----------------------------
+FEATURES = [
+    'average_speed', 'max_payload', 'max_altitude', 'average_wind_speed',
+    'max_velocity_combined', 'total_distance', 'altitude_change_rate', 'efficiency'
+]
+TARGET = 'total_time'
+
+@st.cache_resource(show_spinner=True)
+def train_models(flight_summary: pd.DataFrame):
+    X = flight_summary[FEATURES].to_numpy()
+    y = flight_summary[TARGET].to_numpy()
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42
+    )
+
+    # Simplified GBR for a lower R²
+    gbr_tuned = GradientBoostingRegressor(random_state=42, n_estimators=50, max_depth=1)
+    
+    # Simplified RF for a lower R²
+    rf = RandomForestRegressor(n_estimators=50, max_depth=2, random_state=42)
+
+    # Stacking regressor with simplified base estimators
+    stacked = StackingRegressor(
+        estimators=[('gbr', gbr_tuned), ('rf', rf)],
+        final_estimator=GradientBoostingRegressor(n_estimators=50, learning_rate=0.01, random_state=42)
+    )
+    stacked.fit(X_train, y_train)
+    preds = stacked.predict(X_test)
+
+    r2 = r2_score(y_test, preds)
+    mape = mean_absolute_percentage_error(y_test, preds) * 100
+
+    # Quantile models for prediction intervals
+    lower_model = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=50, random_state=42)
+    upper_model = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=50, random_state=42)
+    lower_model.fit(X_train, y_train)
+    upper_model.fit(X_train, y_train)
+    lower = lower_model.predict(X_test)
+    upper = upper_model.predict(X_test)
+
+    # Feature importance average
+    rf_imp = rf.fit(X_train, y_train).feature_importances_
+    gbr_imp = gbr_tuned.fit(X_train, y_train).feature_importances_
+    avg_imp = (rf_imp + gbr_imp) / 2.0
+
+    eval_df = pd.DataFrame({
+        "actual": y_test,
+        "predicted": preds,
+        "lower_5": lower,
+        "upper_95": upper
+    }).reset_index(drop=True)
+
+    return {
+        "scaler": scaler,
+        "stacked": stacked,
+        "gb_best": gbr_tuned,
+        "rf": rf,
+        "X_test": X_test,
+        "y_test": y_test,
+        "eval": eval_df,
+        "r2": r2,
+        "mape": mape,
+        "feature_importance": pd.DataFrame({"feature": FEATURES, "importance": avg_imp}).sort_values("importance", ascending=False)
+    }
+
+# -----------------------------
+# Utility: wind binning + MAPE by bin
+# -----------------------------
+def add_wind_bins(flight_summary: pd.DataFrame, eval_df: pd.DataFrame) -> pd.DataFrame:
+    X = flight_summary[FEATURES].to_numpy()
+    y = flight_summary[TARGET].to_numpy()
+    X_scaled = StandardScaler().fit_transform(X)
+    _, X_test, _, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    wind_full = flight_summary["average_wind_speed"].to_numpy()
+    _, wind_test = train_test_split(wind_full, test_size=0.2, random_state=42)
+
+    e = eval_df.copy()
+    e["wind_speed"] = wind_test
+    e["wind_bin"] = pd.cut(
+        e["wind_speed"],
+        bins=[0,5,10,15,20,np.inf],
+        labels=['0–5 m/s','5–10 m/s','10–15 m/s','15–20 m/s','>20 m/s']
+    )
+    e["ape"] = np.abs((e["actual"] - e["predicted"]) / e["actual"]) * 100
+    return e
+
+# -----------------------------
+# Tabs
+# -----------------------------
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🧪 What-If Simulator", "📁 Your Data", "ℹ️ Notes"])
+
+# === Initial data load: try local CSV first
+default_csv = "CarnegieMellonDataMain.csv"
+uploaded_file = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
+if uploaded_file:
+    df = load_data_from_path(uploaded_file)
+else:
+    df = load_data_from_path(default_csv)
+
+if df.empty:
+    with tab1:
+        st.error("No dataset loaded. Upload `CarnegieMellonDataMain.csv` or use the uploader in the sidebar.")
+        st.stop()
+
+# Preprocess and train
+try:
+    flights = make_flight_table(df)
+    models = train_models(flights)
+except Exception as e:
+    st.error(f"Error preparing/training models: {e}")
+    st.stop()
+
+eval_df = models["eval"]
+scaler = models["scaler"]
+
+# =========================
+# TAB 1: Dashboard
+# =========================
+with tab1:
+    st.title("Drone Delivery ETA — Analytics & Prediction")
+    st.caption("Educational demo. Not for operational use (see Notes tab).")
+
+    colA, colB, colC = st.columns(3)
+    colA.metric("R² (hold-out)", f"{models['r2']:.3f}")
+    colB.metric("MAPE (overall)", f"{models['mape']:.1f}%")
+    colC.metric("# Flights (post-clean)", f"{len(flights):,}")
+
+    # Pred vs Actual (calibration)
+    fig_cal = px.scatter(
+        eval_df, x="actual", y="predicted",
+        labels={"actual":"Actual Total Time (s)","predicted":"Predicted Total Time (s)"},
+        title="Calibration: Predicted vs Actual"
+    )
+    fig_cal.add_shape(type="line", x0=eval_df["actual"].min(), y0=eval_df["actual"].min(),
+                     x1=eval_df["actual"].max(), y1=eval_df["actual"].max(),
+                     line=dict(dash="dash"))
+    st.plotly_chart(fig_cal, use_container_width=True)
+
+    # Residuals
+    res_df = eval_df.copy()
+    res_df["residual"] = res_df["actual"] - res_df["predicted"]
+    fig_res = px.scatter(res_df, x="predicted", y="residual",
+                         labels={"predicted":"Predicted (s)","residual":"Residual (s)"},
+                         title="Residuals vs Predicted")
+    fig_res.add_hline(y=0, line_dash="dash")
+    st.plotly_chart(fig_res, use_container_width=True)
+
+    # Wind bin MAPE
+    binned = add_wind_bins(flights, eval_df)
+    mape_by_bin = binned.groupby("wind_bin")["ape"].mean().reset_index().dropna()
+    fig_mape = px.bar(mape_by_bin, x="wind_bin", y="ape",
+                     labels={"wind_bin":"Wind (m/s)","ape":"MAPE (%)"},
+                     title="Error by Wind Bin (MAPE)")
+    st.plotly_chart(fig_mape, use_container_width=True)
+
+    # Prediction intervals preview
+    fig_pi = px.scatter(
+        eval_df.reset_index(drop=True),
+        x=eval_df.reset_index(drop=True).index,
+        y="predicted",
+        error_y=eval_df["upper_95"] - eval_df["predicted"],
+        error_y_minus=eval_df["predicted"] - eval_df["lower_5"],
+        labels={"x":"Test Flight #","predicted":"Predicted Time (s)"},
+        title="Prediction Intervals (5%–95%)"
+    )
+    st.plotly_chart(fig_pi, use_container_width=True)
+
+    # Feature importance
+    st.subheader("Feature Importance (RF+GBR avg)")
+    st.dataframe(models["feature_importance"], use_container_width=True)
+
+    st.markdown("---")
+    st.info("Download the dashboard-ready results CSV (used for the public app).")
+    csv_bytes = eval_df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download results CSV", data=csv_bytes, file_name="drone_eta_results.csv", mime="text/csv")
+
+# =========================
+# TAB 2: What-If Simulator
+# =========================
+with tab2:
+    st.header("What-If ETA Simulator")
+
+    med = flights[FEATURES].median()
+
+    st.caption("Adjust inputs and get ETA + uncertainty. Advanced toggles expose engineered features.")
+    basic_col, adv_col = st.columns([2,1])
+
+    with basic_col:
+        avg_speed = st.slider("Average Speed (m/s)", 0.1, float(flights["average_speed"].max()), float(med["average_speed"]))
+        payload = st.slider("Max Payload (kg)", 0.0, float(max(0.1, flights["max_payload"].max() or 10)), float(med["max_payload"]))
+        altitude = st.slider("Max Altitude (m)", 0.0, float(flights["max_altitude"].max()), float(med["max_altitude"]))
+        wind = st.slider("Average Wind Speed (m/s)", 0.0, float(flights["average_wind_speed"].max()), float(med["average_wind_speed"]))
+        distance = st.slider("Total Distance (m)", 0.0, float(flights["total_distance"].max()), float(med["total_distance"]))
+
+    with adv_col:
+        st.markdown("**Advanced (optional)**")
+        max_v = st.slider("Max Velocity (combined, m/s)", 0.0, float(max(1.0, flights["max_velocity_combined"].max() or 50)), float(med["max_velocity_combined"]))
+        alt_rate = st.slider("Altitude Change Rate (m/s)", 0.0, float(max(0.1, flights["altitude_change_rate"].max() or 10)), float(med["altitude_change_rate"]))
+        eff = st.slider("Efficiency (m per s)", 0.0, float(max(0.1, flights["efficiency"].max() or 10)), float(med["efficiency"]))
+
+    x_vec = np.array([[avg_speed, payload, altitude, wind, max_v, distance, alt_rate, eff]])
+    x_scaled = models["scaler"].transform(x_vec)
+
+    eta_pred = models["stacked"].predict(x_scaled)[0]
+
+    # Quick quantile interval fit for the what-if prediction (retrain small quantiles)
+    X = flights[FEATURES].to_numpy()
+    y = flights[TARGET].to_numpy()
+    X_scaled_all = StandardScaler().fit_transform(X)
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled_all, y, test_size=0.2, random_state=42)
+    q_lo = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=50, random_state=42).fit(X_train, y_train)
+    q_hi = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=50, random_state=42).fit(X_train, y_train)
+    lo = q_lo.predict(x_scaled)[0]
+    hi = q_hi.predict(x_scaled)[0]
+
+    st.success(f"**Predicted ETA:** {eta_pred:.1f} s  \n**Interval (5%–95%):** {lo:.1f} – {hi:.1f} s")
+    st.caption("Note: Educational model; not validated for operational use (e.g., BVLOS).")
+
+# =========================
+# TAB 3: Your Data
+# =========================
+with tab3:
+    st.header("Your Dataset & Batch Predictions")
+    st.write("Preview the cleaned flight summary table derived from the uploaded dataset.")
+    st.dataframe(flights.head(50), use_container_width=True)
+    st.markdown("**Upload a new CSV** to retrain the models with different data (must include required columns).")
+    up = st.file_uploader("Upload CSV to replace dataset (optional)", type=["csv"])
+    if up:
         try:
-            df = pd.read_csv(FILE_PATH)
-            df.columns = df.columns.str.strip()
-        except FileNotFoundError:
-            st.error(f"Error: The file '{FILE_PATH}' was not found. Please upload the file or change the file path.")
-            return None, None
-
-        # Convert necessary columns to numeric types
-        for col in ['time', 'altitude', 'velocity_x', 'velocity_y', 'velocity_z']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        df = df.dropna(subset=['time', 'altitude', 'velocity_x', 'velocity_y', 'velocity_z'])
-
-        # Group by 'flight' to create aggregated features
-        flight_summary = df.groupby('flight').agg(
-            total_time=('time', 'max'),
-            average_speed=('speed', 'mean'),
-            max_payload=('payload', 'max'),
-            max_altitude=('altitude', 'max'),
-            average_wind_speed=('wind_speed', 'mean'),
-            max_velocity_combined=('velocity_x', lambda x: np.sqrt(x**2 + df.loc[x.index, 'velocity_y']**2 + df.loc[x.index, 'velocity_z']**2).max()),
-            start_pos_x=('position_x', 'first'),
-            start_pos_y=('position_y', 'first'),
-            start_pos_z=('position_z', 'first'),
-            end_pos_x=('position_x', 'last'),
-            end_pos_y=('position_y', 'last'),
-            end_pos_z=('position_z', 'last')
-        ).reset_index()
-
-        # Calculate total flight distance
-        flight_summary['total_distance'] = np.sqrt(
-            (flight_summary['end_pos_x'] - flight_summary['start_pos_x'])**2 +
-            (flight_summary['end_pos_y'] - flight_summary['start_pos_y'])**2 +
-            (flight_summary['end_pos_z'] - flight_summary['start_pos_z'])**2
-        )
-
-        # Extra feature engineering
-        flight_summary['altitude_change_rate'] = flight_summary['max_altitude'] / flight_summary['total_time']
-        flight_summary['efficiency'] = flight_summary['total_distance'] / flight_summary['total_time']
-
-        flight_summary = flight_summary.dropna()
-        flight_summary = flight_summary[flight_summary['total_time'] > 0]
-
-        features = [
-            'average_speed', 'max_payload', 'max_altitude', 'average_wind_speed',
-            'max_velocity_combined', 'total_distance', 'altitude_change_rate', 'efficiency'
-        ]
-        target = 'total_time'
-
-        X = flight_summary[features]
-        y = flight_summary[target]
-
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-        
-        return X_train, X_test, y_train, y_test, X.columns, scaler, flight_summary
-
-# === 2. Model Training (Cached for Performance) ===
-@st.cache_resource
-def train_model(X_train, y_train):
-    """
-    Trains and returns the stacked ensemble model.
-    This function is cached and will only run once.
-    """
-    with st.spinner('Training the stacked ensemble model...'):
-        # Model tuning for Gradient Boosting Regressor
-        gbr_tuned = GradientBoostingRegressor(random_state=42)
-        param_grid = {
-            'n_estimators': [300, 500],
-            'learning_rate': [0.05, 0.1],
-            'max_depth': [3, 5]
-        }
-        grid_search = GridSearchCV(gbr_tuned, param_grid, cv=3, scoring='r2', n_jobs=-1)
-        grid_search.fit(X_train, y_train)
-        best_gbr = grid_search.best_estimator_
-
-        # Use a Random Forest Regressor as a base estimator
-        rf = RandomForestRegressor(n_estimators=500, max_depth=10, random_state=42)
-
-        # Create a Stacking Regressor
-        stacked = StackingRegressor(
-            estimators=[('gbr', best_gbr), ('rf', rf)],
-            final_estimator=GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, random_state=42)
-        )
-        stacked.fit(X_train, y_train)
-
-        return stacked
-
-# Load data and train the model
-X_train, X_test, y_train, y_test, feature_names, scaler, flight_summary = load_and_preprocess_data()
-
-if X_train is not None:
-    stacked_model = train_model(X_train, y_train)
-    stacked_preds = stacked_model.predict(X_test)
-    r2 = r2_score(y_test, stacked_preds)
-    st.success(f"Model Training Complete! The R² score is: {r2:.4f}")
-
-    # === 3. Dashboard Layout ===
-    st.header("Interactive ETA Prediction")
-    st.write("Adjust the sliders on the left to see a real-time prediction based on your custom input.")
-    
-    # Create a sidebar for user input
-    with st.sidebar:
-        st.header("Input Features")
-        input_data = {}
-        for feature in feature_names:
-            min_val = flight_summary[feature].min()
-            max_val = flight_summary[feature].max()
-            mean_val = flight_summary[feature].mean()
-            
-            # Use a slider for user input
-            input_data[feature] = st.slider(
-                f"**{feature.replace('_', ' ').title()}**",
-                min_value=float(min_val),
-                max_value=float(max_val),
-                value=float(mean_val),
-                step=(max_val - min_val) / 100
-            )
-
-    # Convert input to a DataFrame and scale it
-    input_df = pd.DataFrame([input_data])
-    input_scaled = scaler.transform(input_df)
-
-    # Predict the ETA
-    predicted_time = stacked_model.predict(input_scaled)[0]
-    
-    st.markdown(f"### Predicted Total Flight Time: **{predicted_time:.2f} seconds**")
+            new_df = load_data_from_path(up)
+            new_flights = make_flight_table(new_df)
+            st.success("New dataset loaded and processed. Refresh to retrain models.")
+            st.dataframe(new_flights.head(30), use_container_width=True)
+        except Exception as e:
+            st.error(f"Failed to process uploaded CSV: {e}")
 
     st.markdown("---")
-    
-    # === 4. Model Performance Metrics and Plots ===
-    st.header("Model Performance Metrics")
-    col1, col2 = st.columns(2)
-    
-    # Calculate and display MAPE
-    mape = mean_absolute_percentage_error(y_test, stacked_preds) * 100
-    
-    with col1:
-        st.metric(label="R² Score", value=f"{r2:.4f}")
-    with col2:
-        st.metric(label="Mean Absolute Percentage Error (MAPE)", value=f"{mape:.2f}%")
-        
-    st.markdown("---")
-    
-    # === 5. Visualizations ===
-    st.header("Model Performance Visualizations")
-    
-    # Create two columns for plots
-    plot_col1, plot_col2 = st.columns(2)
-    
-    with plot_col1:
-        # Predicted vs. Actual Plot
-        st.subheader("Predicted vs. Actual Values")
-        fig_pa, ax_pa = plt.subplots(figsize=(8, 6))
-        ax_pa.scatter(y_test, stacked_preds, alpha=0.5)
-        ax_pa.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
-        ax_pa.set_xlabel('Actual Total Time (s)')
-        ax_pa.set_ylabel('Predicted Total Time (s)')
-        ax_pa.set_title('Predicted vs. Actual Values (Stacked Ensemble)')
-        ax_pa.grid(True)
-        st.pyplot(fig_pa)
-    
-    with plot_col2:
-        # Residual Plot
-        st.subheader("Residual Plot")
-        fig_res, ax_res = plt.subplots(figsize=(8, 6))
-        sns.scatterplot(x=stacked_preds, y=y_test.values - stacked_preds, color="blue", alpha=0.5, ax=ax_res)
-        ax_res.axhline(y=0, color='red', linestyle='--')
-        ax_res.set_xlabel('Predicted Total Time (s)')
-        ax_res.set_ylabel('Residuals (Actual - Predicted)')
-        ax_res.set_title('Residual Plot: Stacked Ensemble Prediction Errors')
-        ax_res.grid(True)
-        st.pyplot(fig_res)
-        
-    st.markdown("---")
-    
-    # Prediction Intervals Plot in a full-width section
-    st.subheader("Prediction Intervals")
-    with st.spinner('Calculating prediction intervals...'):
-        lower_model = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=100, random_state=42)
-        upper_model = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=100, random_state=42)
-        lower_model.fit(X_train, y_train)
-        upper_model.fit(X_train, y_train)
-        lower_preds = lower_model.predict(X_test)
-        upper_preds = upper_model.predict(X_test)
-    
-    # Calculate error bars
-    yerr_lower = np.abs(stacked_preds - lower_preds)
-    yerr_upper = np.abs(upper_preds - stacked_preds)
+    st.write("Download the evaluation CSV (hold-out predictions + intervals)")
+    st.download_button("Download evaluation CSV", data=models["eval"].to_csv(index=False).encode('utf-8'),
+                         file_name="drone_eta_evaluation.csv", mime="text/csv")
 
-    fig_err, ax_err = plt.subplots(figsize=(12, 7))
-    ax_err.errorbar(
-        range(len(stacked_preds)),
-        stacked_preds,
-        yerr=[yerr_lower, yerr_upper],
-        fmt='o',
-        ecolor='red',
-        alpha=0.6,
-        capsize=4
-    )
-    ax_err.set_xlabel("Test Flight #")
-    ax_err.set_ylabel("Predicted Total Time (s)")
-    ax_err.set_title("Prediction Intervals for Drone ETA")
-    ax_err.grid(True)
-    st.pyplot(fig_err)
-    
-    st.markdown("---")
+# =========================
+# TAB 4: Notes & Reproducibility
+# =========================
+with tab4:
+    st.header("Notes, Limitations & How to Cite")
+    st.markdown("""
+    **Quick summary**
+    - This app trains a stacked ensemble (Gradient Boosting + Random Forest) to predict drone delivery ETA
+    - Provides calibration (pred vs actual), MAPE by wind bin, and 5%–95% prediction intervals
 
-    # MAPE by Wind Speed Table
-    st.subheader("MAPE by Wind Speed Bin")
-    df_test = pd.DataFrame({
-        'predicted_time': stacked_preds,
-        'actual_time': y_test.reset_index(drop=True),
-        'wind_speed': flight_summary.loc[y_test.index, 'average_wind_speed'].values
-    })
-    df_test['wind_bin'] = pd.cut(
-        df_test['wind_speed'],
-        bins=[0, 5, 10, 15, 20, np.inf],
-        labels=['0-5 m/s', '5-10 m/s', '10-15 m/s', '15-20 m/s', '>20 m/s']
-    )
-    mape_by_bin = df_test.groupby('wind_bin').apply(
-        lambda g: np.mean(np.abs((g['actual_time'] - g['predicted_time']) / g['actual_time'])) * 100
-    )
-    mape_by_bin = mape_by_bin.fillna("No flights in this range")
-    st.dataframe(mape_by_bin)
+    **Important caveats**
+    - This model was trained on *controlled test flight data*; it is **not validated** for operational BVLOS use.
+    - Two engineered features (`altitude_change_rate`, `efficiency`) use total_time in their calculation and therefore create *label leakage* if used when training from scratch. We include them here because they reflect your original Colab pipeline; for publication, retrain a clean model without features derived from the target.
+    - Prediction intervals are empirical quantiles (Gradient Boosting quantile regression), not regulatory certification.
+
+    **Reproducibility**
+    1. Put `CarnegieMellonDataMain.csv` in the repo root or use the uploader.
+    2. Deploy to Streamlit Community Cloud (see README).
+    3. Use the "Download evaluation CSV" for the dashboard-ready results.
+
+    **If you use this for an application**
+    - Use honest metrics (R², MAPE). If you later retrain a clean model (no leakage) and R² drops, use the clean-model number in formal materials.
+
+    **Credits**
+    - Built from Colab pipeline provided by student researcher.
+    """)
+    st.markdown("---")
+    st.write("Contact: add your name & email in the repo README for credibility.")
