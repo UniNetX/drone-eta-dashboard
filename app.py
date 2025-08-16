@@ -64,6 +64,13 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Dataset missing required columns: {sorted(list(missing))}")
 
+    # Calculate total path length
+    df['dx'] = df.groupby('flight')['position_x'].diff().fillna(0)
+    df['dy'] = df.groupby('flight')['position_y'].diff().fillna(0)
+    df['dz'] = df.groupby('flight')['position_z'].diff().fillna(0)
+    df['incremental_distance'] = np.sqrt(df['dx']**2 + df['dy']**2 + df['dz']**2)
+    
+    # Aggregate features per flight
     flight_summary = df.groupby('flight').agg(
         total_time=('time', 'max'),
         average_speed=('speed', 'mean'),
@@ -76,19 +83,28 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
         start_pos_z=('position_z', 'first'),
         end_pos_x=('position_x', 'last'),
         end_pos_y=('position_y', 'last'),
-        end_pos_z=('position_z', 'last')
+        end_pos_z=('position_z', 'last'),
+        total_path_length=('incremental_distance', 'sum') # New valid feature
     ).reset_index()
 
-    flight_summary["total_distance"] = np.sqrt(
+    # Calculate straight-line distance
+    flight_summary["straight_line_distance"] = np.sqrt(
         (flight_summary['end_pos_x'] - flight_summary['start_pos_x'])**2 +
         (flight_summary['end_pos_y'] - flight_summary['start_pos_y'])**2 +
         (flight_summary['end_pos_z'] - flight_summary['start_pos_z'])**2
     )
 
-    # Extra features (same as your Colab)
-    flight_summary["altitude_change_rate"] = flight_summary["max_altitude"] / flight_summary["total_time"]
-    flight_summary["efficiency"] = flight_summary["total_distance"] / flight_summary["total_time"]
+    # Calculate a valid, non-leaking feature
+    # Using np.where to handle division by zero for total_path_length=0
+    flight_summary["path_straightness"] = np.where(
+        flight_summary["total_path_length"] > 0,
+        flight_summary["straight_line_distance"] / flight_summary["total_path_length"],
+        1.0  # Assign 1.0 for straightness if path length is zero
+    )
 
+    # Drop columns not used in model training, as they are now used to create new ones
+    flight_summary = flight_summary.drop(columns=['start_pos_x', 'start_pos_y', 'start_pos_z', 'end_pos_x', 'end_pos_y', 'end_pos_z'])
+    
     flight_summary = flight_summary.replace([np.inf, -np.inf], np.nan).dropna()
     flight_summary = flight_summary[flight_summary["total_time"] > 0]
     return flight_summary
@@ -98,7 +114,7 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 FEATURES = [
     'average_speed', 'max_payload', 'max_altitude', 'average_wind_speed',
-    'max_velocity_combined', 'total_distance', 'altitude_change_rate', 'efficiency'
+    'max_velocity_combined', 'straight_line_distance', 'total_path_length', 'path_straightness'
 ]
 TARGET = 'total_time'
 
@@ -299,15 +315,15 @@ with tab2:
         payload = st.slider("Max Payload (kg)", 0.0, float(max(0.1, flights["max_payload"].max() or 10)), float(med["max_payload"]))
         altitude = st.slider("Max Altitude (m)", 0.0, float(flights["max_altitude"].max()), float(med["max_altitude"]))
         wind = st.slider("Average Wind Speed (m/s)", 0.0, float(flights["average_wind_speed"].max()), float(med["average_wind_speed"]))
-        distance = st.slider("Total Distance (m)", 0.0, float(flights["total_distance"].max()), float(med["total_distance"]))
-
+        distance = st.slider("Straight-line Distance (m)", 0.0, float(flights["straight_line_distance"].max()), float(med["straight_line_distance"]))
+        path_length = st.slider("Total Path Length (m)", 0.0, float(flights["total_path_length"].max()), float(med["total_path_length"]))
+        
     with adv_col:
         st.markdown("**Advanced (optional)**")
         max_v = st.slider("Max Velocity (combined, m/s)", 0.0, float(max(1.0, flights["max_velocity_combined"].max() or 50)), float(med["max_velocity_combined"]))
-        alt_rate = st.slider("Altitude Change Rate (m/s)", 0.0, float(max(0.1, flights["altitude_change_rate"].max() or 10)), float(med["altitude_change_rate"]))
-        eff = st.slider("Efficiency (m per s)", 0.0, float(max(0.1, flights["efficiency"].max() or 10)), float(med["efficiency"]))
-
-    x_vec = np.array([[avg_speed, payload, altitude, wind, max_v, distance, alt_rate, eff]])
+        path_str = st.slider("Path Straightness (1=perfect)", 0.0, float(max(1.0, flights["path_straightness"].max() or 1.0)), float(med["path_straightness"]))
+    
+    x_vec = np.array([[avg_speed, payload, altitude, wind, max_v, distance, path_length, path_str]])
     x_scaled = models["scaler"].transform(x_vec)
 
     eta_pred = models["stacked"].predict(x_scaled)[0]
@@ -320,7 +336,7 @@ with tab2:
     q_lo = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=100, random_state=42).fit(X_train, y_train)
     q_hi = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=100, random_state=42).fit(X_train, y_train)
     lo = q_lo.predict(x_scaled)[0]
-    hi = q_hi.predict(x_scaled)[0]
+    hi = q_hi.predict(x_hi)[0]
 
     st.success(f"**Predicted ETA:** {eta_pred:.1f} s  \n**Interval (5%–95%):** {lo:.1f} – {hi:.1f} s")
     st.caption("Note: Educational model; not validated for operational use (e.g., BVLOS).")
@@ -360,7 +376,7 @@ with tab4:
 
     **Important caveats**
     - This model was trained on *controlled test flight data*; it is **not validated** for operational BVLOS use.
-    - Two engineered features (`altitude_change_rate`, `efficiency`) use total_time in their calculation and therefore create *label leakage* if used when training from scratch. We include them here because they reflect your original Colab pipeline; for publication, retrain a clean model without features derived from the target.
+    - Two engineered features (`altitude_change_rate`, `efficiency`) from the original pipeline caused **label leakage** and have been removed. The new feature, `path_straightness`, is a statistically sound replacement.
     - Prediction intervals are empirical quantiles (Gradient Boosting quantile regression), not regulatory certification.
 
     **Reproducibility**
