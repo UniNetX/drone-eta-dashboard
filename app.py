@@ -1,3 +1,12 @@
+# To deploy this app on a platform like Streamlit Cloud,
+# create a file named 'requirements.txt' with the following content:
+# streamlit
+# pandas
+# scikit-learn
+# numpy
+# matplotlib
+# seaborn
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,7 +19,7 @@ from sklearn.metrics import r2_score, mean_absolute_percentage_error
 
 # Streamlit app title and description
 st.set_page_config(layout="wide", page_title="Drone ETA Dashboard")
-st.title("Drone Estimated Time of Arrival (ETA) Dashboard 🚀")
+st.title("Drone Estimated Time of Arrival (ETA) Dashboard �")
 st.markdown("""
 This dashboard provides a comprehensive view of the stacked ensemble model's performance for predicting drone flight times.
 Explore the interactive prediction tool and review key performance metrics and visualizations below.
