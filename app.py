@@ -1,3 +1,12 @@
+# To deploy this app on a platform like Streamlit Cloud,
+# create a file named 'requirements.txt' with the following content:
+# streamlit
+# pandas
+# scikit-learn
+# numpy
+# matplotlib
+# seaborn
+
 import os
 import io
 import numpy as np
@@ -6,7 +15,7 @@ import streamlit as st
 import plotly.express as px
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import r2_score, mean_absolute_percentage_error
 import warnings
 warnings.filterwarnings("ignore")
@@ -20,11 +29,11 @@ st.sidebar.title("🛩️ Drone ETA Lab")
 st.sidebar.markdown(
 """
 **What this does**
-- Trains an ETA model from your dataset  
-- Shows calibration & error by wind  
-- Gives prediction intervals  
-- Lets you test “what-if” inputs  
-- Batch-predict on uploaded CSV  
+- Trains an ETA model from your dataset
+- Shows calibration & error by wind
+- Gives prediction intervals
+- Lets you test “what-if” inputs
+- Batch-predict on uploaded CSV
 """
 )
 
@@ -64,12 +73,6 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Dataset missing required columns: {sorted(list(missing))}")
 
-    # Calculate total path length
-    df['dx'] = df.groupby('flight')['position_x'].diff().fillna(0)
-    df['dy'] = df.groupby('flight')['position_y'].diff().fillna(0)
-    df['dz'] = df.groupby('flight')['position_z'].diff().fillna(0)
-    df['incremental_distance'] = np.sqrt(df['dx']**2 + df['dy']**2 + df['dz']**2)
-    
     # Aggregate features per flight
     flight_summary = df.groupby('flight').agg(
         total_time=('time', 'max'),
@@ -83,28 +86,17 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
         start_pos_z=('position_z', 'first'),
         end_pos_x=('position_x', 'last'),
         end_pos_y=('position_y', 'last'),
-        end_pos_z=('position_z', 'last'),
-        total_path_length=('incremental_distance', 'sum') # New valid feature
+        end_pos_z=('position_z', 'last')
     ).reset_index()
 
-    # Calculate straight-line distance
-    flight_summary["straight_line_distance"] = np.sqrt(
+    # Calculate the total straight-line distance, which is a strong predictor
+    flight_summary["total_distance"] = np.sqrt(
         (flight_summary['end_pos_x'] - flight_summary['start_pos_x'])**2 +
         (flight_summary['end_pos_y'] - flight_summary['start_pos_y'])**2 +
         (flight_summary['end_pos_z'] - flight_summary['start_pos_z'])**2
     )
 
-    # Calculate a valid, non-leaking feature
-    # Using np.where to handle division by zero for total_path_length=0
-    flight_summary["path_straightness"] = np.where(
-        flight_summary["total_path_length"] > 0,
-        flight_summary["straight_line_distance"] / flight_summary["total_path_length"],
-        1.0  # Assign 1.0 for straightness if path length is zero
-    )
-
-    # Drop columns not used in model training, as they are now used to create new ones
-    flight_summary = flight_summary.drop(columns=['start_pos_x', 'start_pos_y', 'start_pos_z', 'end_pos_x', 'end_pos_y', 'end_pos_z'])
-    
+    # Clean up and return
     flight_summary = flight_summary.replace([np.inf, -np.inf], np.nan).dropna()
     flight_summary = flight_summary[flight_summary["total_time"] > 0]
     return flight_summary
@@ -112,9 +104,10 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 # Model training (cached)
 # -----------------------------
+# Reverted to a core set of reliable features
 FEATURES = [
     'average_speed', 'max_payload', 'max_altitude', 'average_wind_speed',
-    'max_velocity_combined', 'straight_line_distance', 'total_path_length', 'path_straightness'
+    'max_velocity_combined', 'total_distance'
 ]
 TARGET = 'total_time'
 
@@ -130,32 +123,23 @@ def train_models(flight_summary: pd.DataFrame):
         X_scaled, y, test_size=0.2, random_state=42
     )
 
-    # Re-introducing GridSearchCV to find better parameters
-    gbr_tuned = GradientBoostingRegressor(random_state=42)
+    # Use a single GradientBoostingRegressor with a more aggressive grid search
+    gbr = GradientBoostingRegressor(random_state=42)
     param_grid = {
-        'n_estimators': [300],
-        'learning_rate': [0.05],
-        'max_depth': [3]
+        'n_estimators': [500, 1000],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [3, 5, 7],
+        'subsample': [0.8, 1.0]
     }
-    gs = GridSearchCV(gbr_tuned, param_grid, cv=3, scoring='r2', n_jobs=1)
+    gs = GridSearchCV(gbr, param_grid, cv=3, scoring='r2', n_jobs=1, verbose=1)
     gs.fit(X_train, y_train)
     best_gbr = gs.best_estimator_
 
-    # Using a more powerful Random Forest model
-    rf = RandomForestRegressor(n_estimators=300, max_depth=10, random_state=42)
-
-    # Stacking regressor with the re-tuned base estimators
-    stacked = StackingRegressor(
-        estimators=[('gbr', best_gbr), ('rf', rf)],
-        final_estimator=GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, random_state=42)
-    )
-    stacked.fit(X_train, y_train)
-    preds = stacked.predict(X_test)
-
+    preds = best_gbr.predict(X_test)
     r2 = r2_score(y_test, preds)
     mape = mean_absolute_percentage_error(y_test, preds) * 100
 
-    # Quantile models for prediction intervals with improved n_estimators
+    # Quantile models for prediction intervals
     lower_model = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=100, random_state=42)
     upper_model = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=100, random_state=42)
     lower_model.fit(X_train, y_train)
@@ -163,10 +147,8 @@ def train_models(flight_summary: pd.DataFrame):
     lower = lower_model.predict(X_test)
     upper = upper_model.predict(X_test)
 
-    # Feature importance average
-    rf_imp = rf.fit(X_train, y_train).feature_importances_
-    gbr_imp = best_gbr.fit(X_train, y_train).feature_importances_
-    avg_imp = (rf_imp + gbr_imp) / 2.0
+    # Get feature importance from the best model
+    feature_importance = best_gbr.feature_importances_
 
     eval_df = pd.DataFrame({
         "actual": y_test,
@@ -177,15 +159,13 @@ def train_models(flight_summary: pd.DataFrame):
 
     return {
         "scaler": scaler,
-        "stacked": stacked,
-        "gb_best": best_gbr,
-        "rf": rf,
+        "model": best_gbr,
         "X_test": X_test,
         "y_test": y_test,
         "eval": eval_df,
         "r2": r2,
         "mape": mape,
-        "feature_importance": pd.DataFrame({"feature": FEATURES, "importance": avg_imp}).sort_values("importance", ascending=False)
+        "feature_importance": pd.DataFrame({"feature": FEATURES, "importance": feature_importance}).sort_values("importance", ascending=False)
     }
 
 # -----------------------------
@@ -291,7 +271,7 @@ with tab1:
     st.plotly_chart(fig_pi, use_container_width=True)
 
     # Feature importance
-    st.subheader("Feature Importance (RF+GBR avg)")
+    st.subheader("Feature Importance")
     st.dataframe(models["feature_importance"], use_container_width=True)
 
     st.markdown("---")
@@ -308,25 +288,18 @@ with tab2:
     med = flights[FEATURES].median()
 
     st.caption("Adjust inputs and get ETA + uncertainty. Advanced toggles expose engineered features.")
-    basic_col, adv_col = st.columns([2,1])
-
-    with basic_col:
-        avg_speed = st.slider("Average Speed (m/s)", 0.1, float(flights["average_speed"].max()), float(med["average_speed"]))
-        payload = st.slider("Max Payload (kg)", 0.0, float(max(0.1, flights["max_payload"].max() or 10)), float(med["max_payload"]))
-        altitude = st.slider("Max Altitude (m)", 0.0, float(flights["max_altitude"].max()), float(med["max_altitude"]))
-        wind = st.slider("Average Wind Speed (m/s)", 0.0, float(flights["average_wind_speed"].max()), float(med["average_wind_speed"]))
-        distance = st.slider("Straight-line Distance (m)", 0.0, float(flights["straight_line_distance"].max()), float(med["straight_line_distance"]))
-        path_length = st.slider("Total Path Length (m)", 0.0, float(flights["total_path_length"].max()), float(med["total_path_length"]))
-        
-    with adv_col:
-        st.markdown("**Advanced (optional)**")
-        max_v = st.slider("Max Velocity (combined, m/s)", 0.0, float(max(1.0, flights["max_velocity_combined"].max() or 50)), float(med["max_velocity_combined"]))
-        path_str = st.slider("Path Straightness (1=perfect)", 0.0, float(max(1.0, flights["path_straightness"].max() or 1.0)), float(med["path_straightness"]))
     
-    x_vec = np.array([[avg_speed, payload, altitude, wind, max_v, distance, path_length, path_str]])
+    avg_speed = st.slider("Average Speed (m/s)", 0.1, float(flights["average_speed"].max()), float(med["average_speed"]))
+    payload = st.slider("Max Payload (kg)", 0.0, float(max(0.1, flights["max_payload"].max() or 10)), float(med["max_payload"]))
+    altitude = st.slider("Max Altitude (m)", 0.0, float(flights["max_altitude"].max()), float(med["max_altitude"]))
+    wind = st.slider("Average Wind Speed (m/s)", 0.0, float(flights["average_wind_speed"].max()), float(med["average_wind_speed"]))
+    max_v = st.slider("Max Velocity (combined, m/s)", 0.0, float(max(1.0, flights["max_velocity_combined"].max() or 50)), float(med["max_velocity_combined"]))
+    distance = st.slider("Total Distance (m)", 0.0, float(flights["total_distance"].max()), float(med["total_distance"]))
+
+    x_vec = np.array([[avg_speed, payload, altitude, wind, max_v, distance]])
     x_scaled = models["scaler"].transform(x_vec)
 
-    eta_pred = models["stacked"].predict(x_scaled)[0]
+    eta_pred = models["model"].predict(x_scaled)[0]
 
     # Quick quantile interval fit for the what-if prediction (retrain small quantiles)
     X = flights[FEATURES].to_numpy()
@@ -336,7 +309,7 @@ with tab2:
     q_lo = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=100, random_state=42).fit(X_train, y_train)
     q_hi = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=100, random_state=42).fit(X_train, y_train)
     lo = q_lo.predict(x_scaled)[0]
-    hi = q_hi.predict(x_hi)[0]
+    hi = q_hi.predict(x_scaled)[0]
 
     st.success(f"**Predicted ETA:** {eta_pred:.1f} s  \n**Interval (5%–95%):** {lo:.1f} – {hi:.1f} s")
     st.caption("Note: Educational model; not validated for operational use (e.g., BVLOS).")
@@ -366,7 +339,7 @@ with tab3:
 
 # =========================
 # TAB 4: Notes & Reproducibility
-# =========================
+# -----------------------------
 with tab4:
     st.header("Notes, Limitations & How to Cite")
     st.markdown("""
