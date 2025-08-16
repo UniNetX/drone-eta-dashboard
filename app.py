@@ -1,12 +1,3 @@
-# To deploy this app on a platform like Streamlit Cloud,
-# create a file named 'requirements.txt' with the following content:
-# streamlit
-# pandas
-# scikit-learn
-# numpy
-# matplotlib
-# seaborn
-
 import os
 import io
 import numpy as np
@@ -123,16 +114,24 @@ def train_models(flight_summary: pd.DataFrame):
         X_scaled, y, test_size=0.2, random_state=42
     )
 
-    # Simplified GBR for a lower R²
-    gbr_tuned = GradientBoostingRegressor(random_state=42, n_estimators=50, max_depth=1)
-    
-    # Simplified RF for a lower R²
-    rf = RandomForestRegressor(n_estimators=50, max_depth=2, random_state=42)
+    # Re-introducing GridSearchCV to find better parameters
+    gbr_tuned = GradientBoostingRegressor(random_state=42)
+    param_grid = {
+        'n_estimators': [300],
+        'learning_rate': [0.05],
+        'max_depth': [3]
+    }
+    gs = GridSearchCV(gbr_tuned, param_grid, cv=3, scoring='r2', n_jobs=1)
+    gs.fit(X_train, y_train)
+    best_gbr = gs.best_estimator_
 
-    # Stacking regressor with simplified base estimators
+    # Using a more powerful Random Forest model
+    rf = RandomForestRegressor(n_estimators=300, max_depth=10, random_state=42)
+
+    # Stacking regressor with the re-tuned base estimators
     stacked = StackingRegressor(
-        estimators=[('gbr', gbr_tuned), ('rf', rf)],
-        final_estimator=GradientBoostingRegressor(n_estimators=50, learning_rate=0.01, random_state=42)
+        estimators=[('gbr', best_gbr), ('rf', rf)],
+        final_estimator=GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, random_state=42)
     )
     stacked.fit(X_train, y_train)
     preds = stacked.predict(X_test)
@@ -140,9 +139,9 @@ def train_models(flight_summary: pd.DataFrame):
     r2 = r2_score(y_test, preds)
     mape = mean_absolute_percentage_error(y_test, preds) * 100
 
-    # Quantile models for prediction intervals
-    lower_model = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=50, random_state=42)
-    upper_model = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=50, random_state=42)
+    # Quantile models for prediction intervals with improved n_estimators
+    lower_model = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=100, random_state=42)
+    upper_model = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=100, random_state=42)
     lower_model.fit(X_train, y_train)
     upper_model.fit(X_train, y_train)
     lower = lower_model.predict(X_test)
@@ -150,7 +149,7 @@ def train_models(flight_summary: pd.DataFrame):
 
     # Feature importance average
     rf_imp = rf.fit(X_train, y_train).feature_importances_
-    gbr_imp = gbr_tuned.fit(X_train, y_train).feature_importances_
+    gbr_imp = best_gbr.fit(X_train, y_train).feature_importances_
     avg_imp = (rf_imp + gbr_imp) / 2.0
 
     eval_df = pd.DataFrame({
@@ -163,7 +162,7 @@ def train_models(flight_summary: pd.DataFrame):
     return {
         "scaler": scaler,
         "stacked": stacked,
-        "gb_best": gbr_tuned,
+        "gb_best": best_gbr,
         "rf": rf,
         "X_test": X_test,
         "y_test": y_test,
@@ -318,8 +317,8 @@ with tab2:
     y = flights[TARGET].to_numpy()
     X_scaled_all = StandardScaler().fit_transform(X)
     X_train, X_test, y_train, y_test = train_test_split(X_scaled_all, y, test_size=0.2, random_state=42)
-    q_lo = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=50, random_state=42).fit(X_train, y_train)
-    q_hi = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=50, random_state=42).fit(X_train, y_train)
+    q_lo = GradientBoostingRegressor(loss='quantile', alpha=0.05, n_estimators=100, random_state=42).fit(X_train, y_train)
+    q_hi = GradientBoostingRegressor(loss='quantile', alpha=0.95, n_estimators=100, random_state=42).fit(X_train, y_train)
     lo = q_lo.predict(x_scaled)[0]
     hi = q_hi.predict(x_scaled)[0]
 
