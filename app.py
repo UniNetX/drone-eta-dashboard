@@ -63,7 +63,8 @@ def make_eval_df(y_true: np.ndarray, y_pred: np.ndarray, lo: np.ndarray, hi: np.
     e["abs_err"] = np.abs(e["actual"] - e["predicted"])
     e["pi_width"] = e["upper_95"] - e["lower_5"]
     e["wind_bin"] = pd.cut(e["wind_speed"], bins=[0,5,10,15,20, np.inf],
-                           labels=["0–5 m/s","5–10 m/s","10–15 m/s","15–20 m/s",">20 m/s"])
+                           labels=["0–5 m/s","5–10 m/s","10–15 m/s","15–20 m/s",">20 m/s"],
+                           right=False) # Use right=False for left-inclusive bins
     return e.reset_index(drop=True)
 
 # ---------------------------
@@ -98,6 +99,10 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Dataset missing required columns: {sorted(list(missing))}")
 
+    # FIX: Calculate combined velocity on the full dataframe first, then aggregate.
+    # This avoids issues with groupby's Series index not matching the original dataframe's index.
+    df['velocity_combined'] = np.sqrt(df['velocity_x']**2 + df['velocity_y']**2 + df['velocity_z']**2)
+
     # Aggregate features per flight
     flight_summary = df.groupby("flight").agg(
         total_time=("time", "max"),
@@ -105,8 +110,7 @@ def make_flight_table(df: pd.DataFrame) -> pd.DataFrame:
         max_payload=("payload", "max"),
         max_altitude=("altitude", "max"),
         average_wind_speed=("wind_speed", "mean"),
-        # compute a combined max velocity magnitude
-        max_velocity_combined=("velocity_x", lambda x: np.sqrt(x**2 + df.loc[x.index, "velocity_y"]**2 + df.loc[x.index, "velocity_z"]**2).max()),
+        max_velocity_combined=("velocity_combined", "max"),
         start_pos_x=("position_x", "first"),
         start_pos_y=("position_y", "first"),
         start_pos_z=("position_z", "first"),
@@ -169,27 +173,28 @@ def train_models(flights: pd.DataFrame) -> Dict[str, Any]:
     # grouped hold-out: 20% flights
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     train_idx, test_idx = next(gss.split(X, resid, groups))
-
-    X_train, X_test = X[train_idx], X[test_idx]
+    
+    # Use pandas iloc to correctly slice the dataframes based on the indices
+    X_train_df, X_test_df = flights.iloc[train_idx][FEATURES], flights.iloc[test_idx][FEATURES]
     resid_train, resid_test = resid[train_idx], resid[test_idx]
     base_test = base_time[test_idx]
     y_test = y[test_idx]
 
     # fit best pipeline on train residuals
-    best_pipe.fit(X_train, resid_train)
-    resid_pred_test = best_pipe.predict(X_test)
+    best_pipe.fit(X_train_df, resid_train)
+    resid_pred_test = best_pipe.predict(X_test_df)
     y_pred_test = base_test + resid_pred_test
 
     holdout_r2 = float(r2_score(y_test, y_pred_test))
     holdout_mape = float(mean_absolute_percentage_error(y_test, y_pred_test) * 100.0)
     holdout_mae = float(mean_absolute_error(y_test, y_pred_test))
 
-    # Quantile GBMs trained on residuals_train to produce PIs on holdout; also fit on full residuals for interactive use.
+    # Quantile GBMs trained on residuals_train to produce PIs on holdout
     scaler = best_pipe.named_steps["scaler"]
     gbr_best = best_pipe.named_steps["gbr"]
 
-    X_train_s = scaler.transform(X_train)
-    X_test_s = scaler.transform(X_test)
+    X_train_s = scaler.transform(X_train_df)
+    X_test_s = scaler.transform(X_test_df)
 
     q_lo = GradientBoostingRegressor(loss="quantile", alpha=0.05,
                                      n_estimators=gbr_best.n_estimators,
@@ -211,11 +216,11 @@ def train_models(flights: pd.DataFrame) -> Dict[str, Any]:
     lo_time = base_test + lo_resid
     hi_time = base_test + hi_resid
 
-    eval_df = make_eval_df(y_test, y_pred_test, lo_time, hi_time, flights.loc[test_idx, "average_wind_speed"].to_numpy())
+    # Pass the appropriate dataframes/arrays to make_eval_df
+    eval_df = make_eval_df(y_test, y_pred_test, lo_time, hi_time, flights.iloc[test_idx]["average_wind_speed"].to_numpy())
     coverage = float(((eval_df["actual"] >= eval_df["lower_5"]) & (eval_df["actual"] <= eval_df["upper_95"])).mean() * 100.0)
 
-    # For interactive what-if: fit quantiles on ALL residuals (less honest for papers but useful for UI)
-    # This is optional but provides quick intervals in the simulator.
+    # For interactive what-if: fit quantiles on ALL residuals
     X_all_s = scaler.transform(X)
     q_lo_all = GradientBoostingRegressor(loss="quantile", alpha=0.05,
                                          n_estimators=gbr_best.n_estimators,
@@ -258,6 +263,8 @@ def main():
     st.sidebar.header("Dataset")
     uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
     use_default = st.sidebar.button("Use default dataset (if present)")
+    
+    # FIX: Move this checkbox to the sidebar where it's defined and used for control
     show_heatmap = st.sidebar.checkbox("Show correlation heatmap", value=True)
     show_ablation = st.sidebar.checkbox("Show ablation (may be slow)", value=False)
 
@@ -327,10 +334,11 @@ def main():
 
         # Wind MAPE bar
         st.subheader("MAPE by Wind Bin (hold-out)")
-        mape_by_bin = eval_df.groupby("wind_bin", observed=True)["abs_err"].apply(
-            lambda s: (s / np.maximum(eval_df.loc[s.index, "actual"], EPS)).mean() * 100
-        ).reset_index().rename(columns={"abs_err":"mape"})
-        mape_by_bin = mape_by_bin.dropna()
+        # FIX: Correctly calculate MAPE by wind bin using a groupby aggregate
+        mape_by_bin = eval_df.groupby("wind_bin", observed=True).apply(
+            lambda g: (np.abs(g["actual"] - g["predicted"]) / np.maximum(g["actual"], EPS)).mean() * 100
+        ).reset_index(name="mape")
+        
         if not mape_by_bin.empty:
             fig_wind = px.bar(mape_by_bin, x="wind_bin", y="mape",
                               labels={"wind_bin":"Wind (m/s)", "mape":"MAPE (%)"},
@@ -353,7 +361,7 @@ def main():
         st.dataframe(models["feature_importance"], use_container_width=True)
 
         # Correlation heatmap
-        if st.sidebar.checkbox("Show correlation heatmap", value=True):
+        if show_heatmap:
             st.subheader("Correlation heatmap (features vs total_time)")
             corr = flights[FEATURES + [TARGET]].corr(numeric_only=True)
             fig = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu")
@@ -363,41 +371,47 @@ def main():
         if show_ablation:
             st.subheader("Feature ablation (ΔR² when removing a feature)")
             try:
+                # FIX: Correctly re-train the pipeline for each ablated feature set
                 test_idx = models["test_idx"]
                 train_idx = np.setdiff1d(np.arange(len(flights)), test_idx)
                 base_pipe = models["pipeline"]
+                
+                # Full model performance on hold-out
                 full_resid = base_pipe.predict(flights.iloc[test_idx][FEATURES].to_numpy())
                 full_pred = models["base_all"][test_idx] + full_resid
                 y_test_all = flights.iloc[test_idx][TARGET].to_numpy()
                 full_r2 = r2_score(y_test_all, full_pred)
+                
                 rows = []
                 for f in FEATURES:
                     keep = [x for x in FEATURES if x != f]
-                    X_train = flights.iloc[train_idx][keep].to_numpy()
-                    resid_train = flights.iloc[train_idx][TARGET].to_numpy() - physics_baseline(
-                        flights.iloc[train_idx]["total_distance"].to_numpy(),
-                        flights.iloc[train_idx]["average_speed"].to_numpy()
-                    )
-                    X_test_local = flights.iloc[test_idx][keep].to_numpy()
+                    
+                    # Re-instantiate a new pipeline for each ablation test
+                    pipe_local = Pipeline([
+                        ("scaler", StandardScaler()),
+                        ("gbr", GradientBoostingRegressor(
+                            n_estimators=base_pipe.named_steps["gbr"].n_estimators,
+                            learning_rate=base_pipe.named_steps["gbr"].learning_rate,
+                            max_depth=base_pipe.named_steps["gbr"].max_depth,
+                            subsample=base_pipe.named_steps["gbr"].subsample,
+                            random_state=42
+                        ))
+                    ])
+                    
+                    # Train on the subset of features
+                    pipe_local.fit(flights.iloc[train_idx][keep], models["base_all"][train_idx])
+                    
+                    # Predict on the hold-out set with the same subset
                     base_test_local = physics_baseline(
                         flights.iloc[test_idx]["total_distance"].to_numpy(),
                         flights.iloc[test_idx]["average_speed"].to_numpy()
                     )
-                    gbr_best = base_pipe.named_steps["gbr"]
-                    pipe_local = Pipeline([
-                        ("scaler", StandardScaler()),
-                        ("gbr", GradientBoostingRegressor(
-                            n_estimators=gbr_best.n_estimators,
-                            learning_rate=gbr_best.learning_rate,
-                            max_depth=gbr_best.max_depth,
-                            subsample=gbr_best.subsample,
-                            random_state=42
-                        ))
-                    ])
-                    pipe_local.fit(X_train, resid_train)
-                    pred_local = base_test_local + pipe_local.predict(X_test_local)
+                    pred_local = base_test_local + pipe_local.predict(flights.iloc[test_idx][keep])
+                    
+                    # Calculate R² and delta
                     r2_local = r2_score(y_test_all, pred_local)
                     rows.append({"feature_removed": f, "ΔR² (remove)": float(full_r2 - r2_local)})
+                
                 ablation_df = pd.DataFrame(rows).sort_values("ΔR² (remove)", ascending=False)
                 st.dataframe(ablation_df, use_container_width=True)
             except Exception as e:
@@ -411,10 +425,11 @@ def main():
         left_col, right_col = st.columns([2,1])
         with left_col:
             med = models["flights"][FEATURES].median()
-            avg_speed = st.number_input("Average Speed (m/s)", min_value=0.1, max_value=float(max(0.1, models["flights"]["average_speed"].max())), value=float(max(0.5, med["average_speed"])))
-            payload = st.number_input("Max Payload (kg)", min_value=0.0, max_value=float(max(0.1, models["flights"]["max_payload"].max())), value=float(med["max_payload"]))
+            # Ensure number_input values are floats and have a max value
+            avg_speed = st.number_input("Average Speed (m/s)", min_value=0.1, max_value=float(max(1.0, models["flights"]["average_speed"].max())), value=float(max(0.5, med["average_speed"])))
+            payload = st.number_input("Max Payload (kg)", min_value=0.0, max_value=float(max(1.0, models["flights"]["max_payload"].max())), value=float(med["max_payload"]))
             altitude = st.number_input("Max Altitude (m)", min_value=0.0, max_value=float(max(1.0, models["flights"]["max_altitude"].max())), value=float(med["max_altitude"]))
-            wind = st.number_input("Average Wind Speed (m/s)", min_value=0.0, max_value=float(max(0.0, models["flights"]["average_wind_speed"].max())), value=float(med["average_wind_speed"]))
+            wind = st.number_input("Average Wind Speed (m/s)", min_value=0.0, max_value=float(max(1.0, models["flights"]["average_wind_speed"].max())), value=float(med["average_wind_speed"]))
             max_v = st.number_input("Max Velocity (m/s)", min_value=0.0, max_value=float(max(1.0, models["flights"]["max_velocity_combined"].max())), value=float(med["max_velocity_combined"]))
             distance = st.number_input("Total Distance (m)", min_value=0.1, max_value=float(max(1.0, models["flights"]["total_distance"].max())), value=float(med["total_distance"]))
 
@@ -495,3 +510,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
